@@ -1,5 +1,5 @@
 """
-Load today's GCS ingestion batches into BigQuery silver staging tables (APPEND).
+Load today's GCS ingestion batches into BigQuery bronze tables (APPEND).
 
 Default scope: only objects under
   gs://{bucket}/raw/{table}/ingestion_date={today_UTC}/
@@ -7,7 +7,8 @@ Default scope: only objects under
 ingestion_time is a TIMESTAMP set to the load moment (when rows enter BigQuery).
 Batch identity / idempotency comes from object_uri in management.load_manifest.
 
-Staging tables live in the silver dataset.
+Bronze tables (bronze.users, bronze.addresses) keep every batch; Dataform
+upserts them into silver.
 Re-runs skip already loaded files. Use --date YYYY-MM-DD for another day.
 """
 
@@ -24,14 +25,14 @@ from google.cloud import bigquery, storage
 PROJECT_ID = "deloitte-ha"
 BUCKET_NAME = "deloitte-ha-raw-data"
 LOCATION = "us-central1"
-SILVER_DATASET = "silver"
+BRONZE_DATASET = "bronze"
 MANAGEMENT_DATASET = "management"
 RAW_PREFIX = "raw"
 MANIFEST_TABLE = "load_manifest"
 
 TABLES = {
-    "users": "users_stg",
-    "addresses": "addresses_stg",
+    "users": "users",
+    "addresses": "addresses",
 }
 
 USERS_SCHEMA = [
@@ -60,8 +61,8 @@ ADDRESSES_SCHEMA = [
 ]
 
 SCHEMAS = {
-    "users_stg": USERS_SCHEMA,
-    "addresses_stg": ADDRESSES_SCHEMA,
+    "users": USERS_SCHEMA,
+    "addresses": ADDRESSES_SCHEMA,
 }
 
 MANIFEST_SCHEMA = [
@@ -155,23 +156,23 @@ def already_loaded(
 
 def load_object(
     bq: bigquery.Client,
-    silver_dataset: str,
-    staging_table: str,
+    bronze_dataset: str,
+    target_table: str,
     object_uri: str,
     ingestion_time: datetime,
 ) -> str:
     """
-    Load one CSV into silver staging.
+    Load one CSV into a bronze table.
 
     CSV has no ingestion_time column; we load into a temp table, then INSERT
-    into staging with ingestion_time = load moment.
+    into bronze with ingestion_time = load moment.
     """
-    dest = f"{bq.project}.{silver_dataset}.{staging_table}"
-    csv_schema = [f for f in SCHEMAS[staging_table] if f.name != "ingestion_time"]
+    dest = f"{bq.project}.{bronze_dataset}.{target_table}"
+    csv_schema = [f for f in SCHEMAS[target_table] if f.name != "ingestion_time"]
     csv_columns = ", ".join(f.name for f in csv_schema)
 
-    temp_table_id = f"_tmp_{staging_table}_{uuid.uuid4().hex[:8]}"
-    temp_ref = f"{bq.project}.{silver_dataset}.{temp_table_id}"
+    temp_table_id = f"_tmp_{target_table}_{uuid.uuid4().hex[:8]}"
+    temp_ref = f"{bq.project}.{bronze_dataset}.{temp_table_id}"
 
     job_config = bigquery.LoadJobConfig(
         schema=csv_schema,
@@ -229,12 +230,12 @@ def record_manifest(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Append today's GCS CSV batches into BigQuery silver staging tables."
+        description="Append today's GCS CSV batches into BigQuery bronze tables."
     )
     parser.add_argument("--project", default=PROJECT_ID)
     parser.add_argument("--bucket", default=BUCKET_NAME)
     parser.add_argument("--location", default=LOCATION)
-    parser.add_argument("--silver-dataset", default=SILVER_DATASET)
+    parser.add_argument("--bronze-dataset", default=BRONZE_DATASET)
     parser.add_argument("--management-dataset", default=MANAGEMENT_DATASET)
     parser.add_argument(
         "--date",
@@ -258,7 +259,7 @@ def main() -> None:
 
     print(f"Project:         {args.project}")
     print(f"Bucket:          gs://{args.bucket}")
-    print(f"Silver:          {args.project}.{args.silver_dataset}")
+    print(f"Bronze:          {args.project}.{args.bronze_dataset}")
     print(f"Management:      {args.project}.{args.management_dataset}")
     print(f"Scan day folder: ingestion_date={day.isoformat()} (UTC)")
     print()
@@ -267,7 +268,7 @@ def main() -> None:
     gcs = storage.Client(project=args.project)
 
     if not args.dry_run:
-        ensure_dataset(bq, args.silver_dataset, args.location)
+        ensure_dataset(bq, args.bronze_dataset, args.location)
         ensure_dataset(bq, args.management_dataset, args.location)
         ensure_table(
             bq,
@@ -276,13 +277,13 @@ def main() -> None:
             MANIFEST_SCHEMA,
             partition_field=None,
         )
-        for staging_table, schema in SCHEMAS.items():
-            ensure_table(bq, args.silver_dataset, staging_table, schema)
+        for target_table, schema in SCHEMAS.items():
+            ensure_table(bq, args.bronze_dataset, target_table, schema)
 
     loaded_count = 0
     skipped_count = 0
 
-    for source_table, staging_table in TABLES.items():
+    for source_table, target_table in TABLES.items():
         uris = list_day_objects(gcs, args.bucket, source_table, day)
         print(f"{source_table}: found {len(uris)} object(s) for {day}")
 
@@ -302,7 +303,7 @@ def main() -> None:
                 else:
                     print(
                         f"  [dry-run] load  {uri} -> "
-                        f"{args.silver_dataset}.{staging_table} "
+                        f"{args.bronze_dataset}.{target_table} "
                         f"(ingestion_time=now)"
                     )
                     loaded_count += 1
@@ -317,13 +318,13 @@ def main() -> None:
 
             ingestion_time = datetime.now(timezone.utc)
             print(
-                f"  load  {uri} -> {args.silver_dataset}.{staging_table} "
+                f"  load  {uri} -> {args.bronze_dataset}.{target_table} "
                 f"(ingestion_time={ingestion_time.isoformat()})"
             )
             job_id = load_object(
                 bq,
-                args.silver_dataset,
-                staging_table,
+                args.bronze_dataset,
+                target_table,
                 uri,
                 ingestion_time,
             )
@@ -331,7 +332,7 @@ def main() -> None:
                 bq,
                 args.management_dataset,
                 uri,
-                staging_table,
+                target_table,
                 ingestion_time,
                 job_id,
             )
