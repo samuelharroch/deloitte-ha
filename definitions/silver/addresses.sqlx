@@ -1,0 +1,48 @@
+config {
+  type: "incremental",
+  schema: "silver",
+  name: "addresses",
+  uniqueKey: ["address_id"],
+  bigquery: {
+    clusterBy: ["address_id"]
+  },
+  description: "Current state of each address, upserted from bronze.addresses. One row per address_id.",
+  assertions: {
+    uniqueKey: ["address_id"],
+    nonNull: ["address_id", "user_id", "updated_at"]
+  }
+}
+
+WITH new_rows AS (
+  SELECT *
+  FROM ${ref("bronze", "addresses")}
+  ${when(incremental(),
+    `WHERE ingestion_time > (
+       SELECT COALESCE(MAX(ingestion_time), TIMESTAMP '1970-01-01')
+       FROM ${self()}
+     )`)}
+),
+
+-- A run can cover several batches; keep only the latest version of each address.
+latest AS (
+  SELECT *
+  FROM new_rows
+  WHERE TRUE
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY address_id
+    ORDER BY updated_at DESC, ingestion_time DESC
+  ) = 1
+)
+
+-- Skip rows older than the version already in silver, so a late batch can't
+-- overwrite fresher data. The uniqueKey MERGE can't take a WHEN MATCHED AND
+-- condition, so the check lives here. Cost: a second scan of the target's join
+-- columns on top of the MERGE's own scan. At scale, replace with a hand-written
+-- MERGE (operations action) using WHEN MATCHED AND s.updated_at > t.updated_at.
+SELECT s.*
+FROM latest AS s
+${when(incremental(),
+  `LEFT JOIN ${self()} AS t
+     ON t.address_id = s.address_id
+   WHERE t.address_id IS NULL
+      OR s.updated_at > t.updated_at`)}

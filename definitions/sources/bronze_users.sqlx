@@ -1,0 +1,6 @@
+config {
+  type: "declaration",
+  schema: "bronze",
+  name: "users",
+  description: "Append-only user batches loaded from GCS by scripts/load_to_bq.py. One row per user per batch."
+}

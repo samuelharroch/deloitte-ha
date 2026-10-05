@@ -1,0 +1,6 @@
+config {
+  type: "declaration",
+  schema: "bronze",
+  name: "addresses",
+  description: "Append-only address batches loaded from GCS by scripts/load_to_bq.py. One row per address per batch."
+}
