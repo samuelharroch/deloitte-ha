@@ -1,0 +1,27 @@
+config {
+  type: "table",
+  schema: "gold",
+  name: "users_details",
+  description: "Current users joined to their addresses. One row per user and address; users without an address are kept with NULL address columns. Source for the Dataproc users-per-city job.",
+  assertions: {
+    uniqueKey: ["user_id", "address_id"],
+    nonNull: ["user_id", "last_updated_at"]
+  }
+}
+
+SELECT
+  u.user_id,
+  u.first_name,
+  u.last_name,
+  u.email,
+  u.phone,
+  u.status,
+  a.address_id,
+  a.city,
+  a.state,
+  a.country,
+  -- GREATEST returns NULL if any input is NULL, so fall back for users without an address.
+  GREATEST(u.updated_at, COALESCE(a.updated_at, u.updated_at)) AS last_updated_at
+FROM ${ref("silver", "users")} AS u
+LEFT JOIN ${ref("silver", "addresses")} AS a
+  ON a.user_id = u.user_id
