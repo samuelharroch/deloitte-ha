@@ -22,6 +22,7 @@ from datetime import date, datetime, timezone
 from google.api_core.exceptions import NotFound
 from google.cloud import bigquery, storage
 
+# --- Defaults (each can be overridden from the command line) ---
 PROJECT_ID = "deloitte-ha"
 BUCKET_NAME = "deloitte-ha-raw-data"
 LOCATION = "us-central1"
@@ -30,11 +31,13 @@ MANAGEMENT_DATASET = "management"
 RAW_PREFIX = "raw"
 MANIFEST_TABLE = "load_manifest"
 
+# Source folder in GCS -> target bronze table.
 TABLES = {
     "users": "users",
     "addresses": "addresses",
 }
 
+# --- Bronze schemas: the CSV columns plus ingestion_time (added at load) ---
 USERS_SCHEMA = [
     bigquery.SchemaField("user_id", "INT64"),
     bigquery.SchemaField("first_name", "STRING"),
@@ -65,6 +68,7 @@ SCHEMAS = {
     "addresses": ADDRESSES_SCHEMA,
 }
 
+# One row per loaded file; object_uri is what makes reruns skip it.
 MANIFEST_SCHEMA = [
     bigquery.SchemaField("object_uri", "STRING"),
     bigquery.SchemaField("table_name", "STRING"),
@@ -74,6 +78,8 @@ MANIFEST_SCHEMA = [
 
 CSV_FILENAME_RE = re.compile(r".+\.csv$", re.IGNORECASE)
 
+
+# --- Setup: create datasets / tables on first run, no-op afterwards ---
 
 def ensure_dataset(bq: bigquery.Client, dataset_id: str, location: str) -> None:
     dataset_ref = bigquery.Dataset(f"{bq.project}.{dataset_id}")
@@ -98,6 +104,7 @@ def ensure_table(
         pass
 
     table = bigquery.Table(table_ref, schema=schema)
+    # Daily partitions on ingestion_time, so queries on recent batches scan less.
     if partition_field:
         table.time_partitioning = bigquery.TimePartitioning(
             type_=bigquery.TimePartitioningType.DAY,
@@ -106,6 +113,8 @@ def ensure_table(
     bq.create_table(table)
     print(f"Created table: {table_ref}")
 
+
+# --- Find files to load ---
 
 def list_day_objects(
     gcs: storage.Client,
@@ -117,6 +126,7 @@ def list_day_objects(
     prefix = f"{RAW_PREFIX}/{table}/ingestion_date={day.isoformat()}/"
     uris: list[str] = []
     for blob in gcs.list_blobs(bucket_name, prefix=prefix):
+        # Skip folder placeholders and anything that isn't a CSV.
         if blob.name.endswith("/") or not CSV_FILENAME_RE.match(blob.name):
             continue
         if blob.name.endswith(".loaded"):
@@ -130,9 +140,11 @@ def already_loaded(
     management_dataset: str,
     object_uris: list[str],
 ) -> set[str]:
+    """Return the URIs from object_uris that are already in the manifest."""
     if not object_uris:
         return set()
 
+    # Query in chunks to keep the array parameter small.
     manifest = f"`{bq.project}.{management_dataset}.{MANIFEST_TABLE}`"
     loaded: set[str] = set()
     chunk_size = 100
@@ -154,6 +166,8 @@ def already_loaded(
     return loaded
 
 
+# --- Load one file and record it ---
+
 def load_object(
     bq: bigquery.Client,
     bronze_dataset: str,
@@ -168,9 +182,11 @@ def load_object(
     into bronze with ingestion_time = load moment.
     """
     dest = f"{bq.project}.{bronze_dataset}.{target_table}"
+    # The CSV has every bronze column except ingestion_time.
     csv_schema = [f for f in SCHEMAS[target_table] if f.name != "ingestion_time"]
     csv_columns = ", ".join(f.name for f in csv_schema)
 
+    # Random suffix so concurrent runs never share a temp table.
     temp_table_id = f"_tmp_{target_table}_{uuid.uuid4().hex[:8]}"
     temp_ref = f"{bq.project}.{bronze_dataset}.{temp_table_id}"
 
@@ -183,9 +199,11 @@ def load_object(
     )
 
     try:
+        # 1. CSV -> temp table.
         load_job = bq.load_table_from_uri(object_uri, temp_ref, job_config=job_config)
         load_job.result()
 
+        # 2. Temp table -> bronze, stamping every row with the same ingestion_time.
         insert_job = bq.query(
             f"""
             INSERT INTO `{dest}` ({csv_columns}, ingestion_time)
@@ -203,6 +221,7 @@ def load_object(
         insert_job.result()
         return load_job.job_id
     finally:
+        # Always drop the temp table, even if the load or insert failed.
         bq.delete_table(temp_ref, not_found_ok=True)
 
 
@@ -214,6 +233,7 @@ def record_manifest(
     ingestion_time: datetime,
     job_id: str,
 ) -> None:
+    """Mark a file as loaded, so later runs skip it."""
     manifest = f"{bq.project}.{management_dataset}.{MANIFEST_TABLE}"
     rows = [
         {
@@ -228,7 +248,9 @@ def record_manifest(
         raise RuntimeError(f"Failed to write load_manifest for {object_uri}: {errors}")
 
 
-def parse_args() -> argparse.Namespace:
+# --- Entry point ---
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Append today's GCS CSV batches into BigQuery bronze tables."
     )
@@ -242,16 +264,13 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Calendar day folder to scan (YYYY-MM-DD, UTC). Default: today UTC.",
     )
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="List files that would be loaded; do not load or write manifest.",
-    )
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
-def main() -> None:
-    args = parse_args()
+def main(argv: list[str] | None = None) -> None:
+    args = parse_args(argv)
+
+    # Which day folder to scan: --date, or today (UTC, matching the upload paths).
     if args.date:
         day = date.fromisoformat(args.date)
     else:
@@ -267,48 +286,31 @@ def main() -> None:
     bq = bigquery.Client(project=args.project, location=args.location)
     gcs = storage.Client(project=args.project)
 
-    if not args.dry_run:
-        ensure_dataset(bq, args.bronze_dataset, args.location)
-        ensure_dataset(bq, args.management_dataset, args.location)
-        ensure_table(
-            bq,
-            args.management_dataset,
-            MANIFEST_TABLE,
-            MANIFEST_SCHEMA,
-            partition_field=None,
-        )
-        for target_table, schema in SCHEMAS.items():
-            ensure_table(bq, args.bronze_dataset, target_table, schema)
+    # Make sure datasets and tables exist.
+    ensure_dataset(bq, args.bronze_dataset, args.location)
+    ensure_dataset(bq, args.management_dataset, args.location)
+    ensure_table(
+        bq,
+        args.management_dataset,
+        MANIFEST_TABLE,
+        MANIFEST_SCHEMA,
+        partition_field=None,
+    )
+    for target_table, schema in SCHEMAS.items():
+        ensure_table(bq, args.bronze_dataset, target_table, schema)
 
     loaded_count = 0
     skipped_count = 0
 
     for source_table, target_table in TABLES.items():
+        # All CSVs in today's folder for this table.
         uris = list_day_objects(gcs, args.bucket, source_table, day)
         print(f"{source_table}: found {len(uris)} object(s) for {day}")
 
         if not uris:
             continue
 
-        if args.dry_run:
-            already: set[str] = set()
-            try:
-                already = already_loaded(bq, args.management_dataset, uris)
-            except NotFound:
-                print("  (manifest table not found yet; all files treated as new)")
-            for uri in uris:
-                if uri in already:
-                    print(f"  [dry-run] skip  {uri}")
-                    skipped_count += 1
-                else:
-                    print(
-                        f"  [dry-run] load  {uri} -> "
-                        f"{args.bronze_dataset}.{target_table} "
-                        f"(ingestion_time=now)"
-                    )
-                    loaded_count += 1
-            continue
-
+        # Load each new file, then record it in the manifest.
         already = already_loaded(bq, args.management_dataset, uris)
         for uri in uris:
             if uri in already:
@@ -316,6 +318,7 @@ def main() -> None:
                 skipped_count += 1
                 continue
 
+            # One timestamp per file: used in bronze and in the manifest.
             ingestion_time = datetime.now(timezone.utc)
             print(
                 f"  load  {uri} -> {args.bronze_dataset}.{target_table} "
@@ -328,6 +331,7 @@ def main() -> None:
                 uri,
                 ingestion_time,
             )
+            # Recorded only after a successful load, so a failed file is retried next run.
             record_manifest(
                 bq,
                 args.management_dataset,
